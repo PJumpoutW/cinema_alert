@@ -1,0 +1,113 @@
+name: DC 오티켓 개봉예정작 리스트 감시
+
+on:
+  schedule:
+    - cron: '7 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Check gallery and notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          cat > check.js << 'SCRIPT_EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          const SEARCH_URL = 'https://gall.dcinside.com/mgallery/board/lists?id=oticket&s_type=search_subject_memo&s_keyword=%EA%B0%9C%EB%B4%89%20%EC%98%88%EC%A0%95%20%EC%98%81%ED%99%94%20%EB%A6%AC%EC%8A%A4%ED%8A%B8';
+          const STATE_FILE = 'last_seen.txt';
+
+          (async () => {
+            const browser = await chromium.launch();
+            const page = await browser.newPage({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            });
+            // networkidle은 광고/트래킹 요청 때문에 이 사이트에서 절대 안 옴 → 8/29 크래시 원인.
+            // domcontentloaded + 실제 결과 테이블 대기로 교체.
+            await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForSelector('#kakao_seach_list tbody tr', { timeout: 15000 });
+
+            const rows = await page.$$eval('#kakao_seach_list tbody tr', trs => trs.map(tr => {
+              const titA = tr.querySelector('td.gall_tit a');
+              const dateEl = tr.querySelector('td.gall_date');
+              if (!titA || !dateEl) return null;
+              const title = titA.textContent.trim();
+              const isoDate = dateEl.getAttribute('title');
+              if (!title || !isoDate) return null;
+              const href = titA.getAttribute('href') || '';
+              const m = href.match(/no=(\d+)/);
+              const no = m ? m[1] : null;
+              return { title, isoDate, no };
+            }).filter(r => r && r.no));
+
+            await browser.close();
+
+            const candidates = rows.filter(r =>
+              r.title.includes('개봉') && r.title.includes('예정') && r.title.includes('리스트')
+            );
+
+            // 시간창 방식 폐기 (cron 지연에 취약, 8/28 알림 누락의 원인).
+            // 글번호 기반 상태 저장으로 교체: 지연/실패에 영향받지 않음.
+            if (!fs.existsSync(STATE_FILE)) {
+              const initNo = candidates.length ? Math.max(...candidates.map(r => parseInt(r.no, 10))) : 0;
+              fs.writeFileSync(STATE_FILE, String(initNo));
+              console.log('최초 실행: 상태 파일 초기화(', initNo, '), 알림 생략.');
+              return;
+            }
+
+            const lastSeen = parseInt(fs.readFileSync(STATE_FILE, 'utf8').trim(), 10) || 0;
+            const fresh = candidates
+              .filter(r => parseInt(r.no, 10) > lastSeen)
+              .sort((a, b) => parseInt(a.no, 10) - parseInt(b.no, 10));
+
+            if (fresh.length === 0) {
+              console.log('새 글 없음. 종료.');
+              return;
+            }
+
+            for (const post of fresh) {
+              const link = `https://gall.dcinside.com/mgallery/board/view/?id=oticket&no=${post.no}`;
+              const content = `🎬 새 개봉 예정작 리스트 글이 올라왔습니다!\n제목: ${post.title}\n작성시각: ${post.isoDate}\n링크: ${link}`;
+              const res = await fetch(process.env.DISCORD_WEBHOOK, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+              });
+              console.log('Discord 응답 상태:', res.status);
+            }
+
+            fs.writeFileSync(STATE_FILE, String(Math.max(...fresh.map(r => parseInt(r.no, 10)))));
+          })();
+          SCRIPT_EOF
+          node check.js
+
+      - name: Commit updated state
+        run: |
+          if [ -n "$(git status --porcelain last_seen.txt)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add last_seen.txt
+            git commit -m "chore: update last seen post number"
+            git push
+          else
+            echo "상태 변경 없음"
+          fi
