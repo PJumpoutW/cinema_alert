@@ -36,15 +36,31 @@ jobs:
           const SEARCH_URL = 'https://gall.dcinside.com/mgallery/board/lists?id=oticket&s_type=search_subject_memo&s_keyword=%EA%B0%9C%EB%B4%89%20%EC%98%88%EC%A0%95%20%EC%98%81%ED%99%94%20%EB%A6%AC%EC%8A%A4%ED%8A%B8';
           const STATE_FILE = 'last_seen.txt';
 
+          async function loadResults(page) {
+            await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForSelector('#kakao_seach_list tbody tr', { timeout: 15000 });
+          }
+
           (async () => {
             const browser = await chromium.launch();
             const page = await browser.newPage({
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             });
-            // networkidle은 광고/트래킹 요청 때문에 이 사이트에서 절대 안 옴 → 8/29 크래시 원인.
-            // domcontentloaded + 실제 결과 테이블 대기로 교체.
-            await page.goto(SEARCH_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-            await page.waitForSelector('#kakao_seach_list tbody tr', { timeout: 15000 });
+
+            try {
+              await loadResults(page);
+            } catch (e1) {
+              console.log('1차 시도 실패, 재시도:', e1.message);
+              try {
+                await loadResults(page);
+              } catch (e2) {
+                // 원인 불명 실패 → 다음엔 추측 안 하게 증거를 남긴다.
+                await page.screenshot({ path: 'failure.png', fullPage: true });
+                fs.writeFileSync('failure.html', await page.content());
+                await browser.close();
+                throw e2;
+              }
+            }
 
             const rows = await page.$$eval('#kakao_seach_list tbody tr', trs => trs.map(tr => {
               const titA = tr.querySelector('td.gall_tit a');
@@ -65,8 +81,6 @@ jobs:
               r.title.includes('개봉') && r.title.includes('예정') && r.title.includes('리스트')
             );
 
-            // 시간창 방식 폐기 (cron 지연에 취약, 8/28 알림 누락의 원인).
-            // 글번호 기반 상태 저장으로 교체: 지연/실패에 영향받지 않음.
             if (!fs.existsSync(STATE_FILE)) {
               const initNo = candidates.length ? Math.max(...candidates.map(r => parseInt(r.no, 10))) : 0;
               fs.writeFileSync(STATE_FILE, String(initNo));
@@ -99,6 +113,16 @@ jobs:
           })();
           SCRIPT_EOF
           node check.js
+
+      - name: Upload failure evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-evidence
+          path: |
+            failure.png
+            failure.html
+          retention-days: 7
 
       - name: Commit updated state
         run: |
