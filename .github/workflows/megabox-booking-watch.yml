@@ -140,7 +140,9 @@ jobs:
             fd.append('masterType', 'movie');
             fd.append('movieNo', movieNo);
             fd.append('movieNo1', movieNo);
-            fd.append('firstAt', 'Y');
+            // firstAt=Y는 요청한 playDe를 무시하고 서버가 "실제 첫 상영일"로 덮어써서 응답함
+            // (직접 확인함) — 우리가 지정한 날짜를 정확히 조회하려면 반드시 N이어야 함.
+            fd.append('firstAt', 'N');
             fd.append('playDe', playDe);
             fd.append('areaCd', areaCd);
             const r = await fetch('https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do', { method: 'POST', body: fd });
@@ -188,8 +190,9 @@ jobs:
                 if (state[stateKey] === true) continue;
 
                 if (found[theater.name]) {
-                  console.log(`"${keyword}" @ 메가박스 ${theater.name}: 예매 오픈 확인 (${found[theater.name]})`);
-                  const content = `🎬 예매 오픈!\n영화: ${keyword}\n극장: 메가박스 ${theater.name}\n상영일: ${found[theater.name]}`;
+                  const displayDate = found[theater.name].replace(/(\d{4})(\d{2})(\d{2})/, '$1-$2-$3');
+                  console.log(`"${keyword}" @ 메가박스 ${theater.name}: 예매 오픈 확인 (${displayDate})`);
+                  const content = `🎬 예매 오픈!\n영화: ${keyword}\n극장: 메가박스 ${theater.name}\n상영일: ${displayDate}`;
                   const res = await fetch(process.env.DISCORD_WEBHOOK, {
                     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content })
                   });

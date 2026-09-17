@@ -105,7 +105,7 @@ jobs:
 
                 if (dates.length > 0) {
                   console.log(`"${keyword}" @ CGV ${siteName}: 예매 오픈 확인 (${dates.length}개 상영일)`);
-                  const content = `🎬 예매 오픈!\n영화: ${movie.movNm}\n극장: CGV ${siteName}\n상영 시작일: ${dates[0].scnYmd}`;
+                  const content = `🎬 예매 오픈!\n영화: ${movie.movNm}\n극장: CGV ${siteName}\n상영일: ${dates[0].scnYmd}`;
                   const res = await fetch(process.env.DISCORD_WEBHOOK, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
