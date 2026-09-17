@@ -19,8 +19,6 @@ jobs:
         with:
           node-version: '20'
 
-      # 이미 movieCd를 찾아놓은 키워드는 Playwright가 필요 없음(순수 fetch로 충분) —
-      # 5분마다 돌리면서 매번 브라우저를 켜는 건 낭비라서, 새 키워드가 있을 때만 브라우저를 씀.
       - name: Check whether movie-code resolution is needed
         id: precheck
         run: |
@@ -61,16 +59,18 @@ jobs:
           const missing = keywords.filter(k => !cache[k]);
 
           (async () => {
-            if (missing.length === 0) return;
+            console.log('캐시 필요 키워드:', JSON.stringify(missing));
+            if (missing.length === 0) { console.log('캐시 필요 없음 — 종료'); return; }
             const browser = await chromium.launch();
 
             for (const keyword of missing) {
               const page = await browser.newPage();
               let movieCd = null;
+              const seenPosts = [];
               page.on('request', req => {
-                if (movieCd) return;
                 const post = req.postData();
-                if (post) {
+                if (post) seenPosts.push(post.slice(0, 200));
+                if (!movieCd && post) {
                   const m = post.match(/"(?:representationMovieCode|movieCd)":"(\d+)"/);
                   if (m) movieCd = m[1];
                 }
@@ -78,20 +78,25 @@ jobs:
               try {
                 await page.goto('https://www.lottecinema.co.kr/NLCHS/Ticketing', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await page.waitForTimeout(1500);
+                console.log(`"${keyword}": 페이지 로드 완료, 클릭 시도`);
                 await page.locator(`text=${keyword}`).first().click({ timeout: 10000 });
+                console.log(`"${keyword}": 클릭 성공, 네트워크 대기`);
                 await page.waitForTimeout(1500);
               } catch (e) {
-                console.log(`"${keyword}": 롯데시네마 영화 목록에서 못 찾음 — 다음 실행에 재시도`);
+                console.log(`"${keyword}": 롯데시네마 영화 목록에서 못 찾음/클릭 실패 — ${e.message.split('\n')[0]}`);
               }
               await page.close();
               if (movieCd) {
                 cache[keyword] = movieCd;
                 console.log(`"${keyword}": movieCd=${movieCd} 확인, 캐시 저장`);
+              } else {
+                console.log(`"${keyword}": movieCd 캡처 실패. 관측된 POST 요청 ${seenPosts.length}건: ${JSON.stringify(seenPosts.slice(0,5))}`);
               }
             }
 
             await browser.close();
             fs.writeFileSync('lotte_movie_cache.json', JSON.stringify(cache, null, 2));
+            console.log('캐시 파일 저장 완료:', JSON.stringify(cache));
           })();
           SCRIPT_EOF
           node resolve_lotte.js
@@ -191,10 +196,16 @@ jobs:
 
       - name: Commit updated state
         run: |
-          git add lotte_state.json lotte_movie_cache.json 2>/dev/null || true
-          if [ -n "$(git status --porcelain lotte_state.json lotte_movie_cache.json 2>/dev/null)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          TARGETS=""
+          for f in lotte_state.json lotte_movie_cache.json; do
+            if [ -f "$f" ]; then
+              git add "$f"
+              TARGETS="$TARGETS $f"
+            fi
+          done
+          if [ -n "$TARGETS" ] && [ -n "$(git status --porcelain -- $TARGETS)" ]; then
             git commit -m "chore: update Lotte Cinema booking state/cache"
             git push
           else
