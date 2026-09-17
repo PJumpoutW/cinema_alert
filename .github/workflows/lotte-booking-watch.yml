@@ -135,15 +135,35 @@ jobs:
             return out;
           }
 
+          // 메가박스 쪽에서 GitHub Actions발 접속이 간헐적 커넥션 타임아웃 나는 걸 확인해서,
+          // 같은 위험을 방지하기 위해 롯데 쪽 호출도 재시도 + 최종 실패시 스킵 처리.
+          async function fetchWithRetry(url, options, attempts = 3, delayMs = 2000) {
+            let lastErr;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                return await fetch(url, options);
+              } catch (e) {
+                lastErr = e;
+                if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
+              }
+            }
+            throw lastErr;
+          }
+
           async function getPlaySequence(cinemaID, movieCd, playDate) {
             const fd = new URLSearchParams();
             fd.append('paramList', JSON.stringify({
               MethodName: 'GetPlaySequence', channelType: 'HO', osType: 'W', osVersion: 'bot',
               playDate, cinemaID, representationMovieCode: movieCd
             }));
-            const r = await fetch('https://www.lottecinema.co.kr/LCWS/Ticketing/TicketingData.aspx', { method: 'POST', body: fd });
-            const j = await r.json();
-            return (j.PlaySeqsHeader && j.PlaySeqsHeader.Items) || [];
+            try {
+              const r = await fetchWithRetry('https://www.lottecinema.co.kr/LCWS/Ticketing/TicketingData.aspx', { method: 'POST', body: fd });
+              const j = await r.json();
+              return (j.PlaySeqsHeader && j.PlaySeqsHeader.Items) || [];
+            } catch (e) {
+              console.log(`  (${playDate} 조회 실패, 이번엔 스킵: ${e.message})`);
+              return [];
+            }
           }
 
           (async () => {

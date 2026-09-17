@@ -135,6 +135,21 @@ jobs:
             return out;
           }
 
+          // megabox.co.kr이 GitHub Actions발 접속을 간헐적으로 커넥션 타임아웃시킴(반복 확인됨).
+          // 재시도 없이 예외가 나면 전체 스크립트가 죽어서, 호출 하나당 재시도 + 최종 실패시 스킵 처리.
+          async function fetchWithRetry(url, options, attempts = 3, delayMs = 2000) {
+            let lastErr;
+            for (let i = 0; i < attempts; i++) {
+              try {
+                return await fetch(url, options);
+              } catch (e) {
+                lastErr = e;
+                if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
+              }
+            }
+            throw lastErr;
+          }
+
           async function getSchedule(movieNo, playDe, areaCd) {
             const fd = new URLSearchParams();
             fd.append('masterType', 'movie');
@@ -145,9 +160,14 @@ jobs:
             fd.append('firstAt', 'N');
             fd.append('playDe', playDe);
             fd.append('areaCd', areaCd);
-            const r = await fetch('https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do', { method: 'POST', body: fd });
-            const j = await r.json();
-            return (j.megaMap && j.megaMap.movieFormList) || [];
+            try {
+              const r = await fetchWithRetry('https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do', { method: 'POST', body: fd });
+              const j = await r.json();
+              return (j.megaMap && j.megaMap.movieFormList) || [];
+            } catch (e) {
+              console.log(`  (areaCd=${areaCd}, playDe=${playDe} 조회 실패, 이번엔 스킵: ${e.message})`);
+              return [];
+            }
           }
 
           (async () => {
