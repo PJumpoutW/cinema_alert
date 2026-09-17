@@ -1,0 +1,213 @@
+name: 메가박스 예매 오픈 감시
+
+on:
+  schedule:
+    - cron: '4-59/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 이미 movieNo를 찾아놓은 키워드는 Playwright가 필요 없음(순수 fetch로 충분) —
+      # 5분마다 돌리면서 매번 브라우저를 켜는 건 낭비라서, 새 키워드가 있을 때만 브라우저를 씀.
+      - name: Check whether movie-code resolution is needed
+        id: precheck
+        run: |
+          if [ ! -f megabox_movie_cache.json ]; then echo '{}' > megabox_movie_cache.json; fi
+          NEED=false
+          if [ -f keywords.txt ]; then
+            while IFS= read -r kw; do
+              [ -z "$kw" ] && continue
+              code=$(jq -r --arg k "$kw" '.[$k] // empty' megabox_movie_cache.json)
+              if [ -z "$code" ]; then NEED=true; fi
+            done < keywords.txt
+          fi
+          echo "need_resolution=$NEED" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        if: steps.precheck.outputs.need_resolution == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install Playwright
+        if: steps.precheck.outputs.need_resolution == 'true'
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Resolve missing movie codes
+        if: steps.precheck.outputs.need_resolution == 'true'
+        run: |
+          cat > resolve_megabox.js << 'SCRIPT_EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          const cache = fs.existsSync('megabox_movie_cache.json') ? JSON.parse(fs.readFileSync('megabox_movie_cache.json', 'utf8')) : {};
+          const keywords = fs.readFileSync('keywords.txt', 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+          const missing = keywords.filter(k => !cache[k]);
+
+          (async () => {
+            if (missing.length === 0) return;
+            const browser = await chromium.launch();
+
+            for (const keyword of missing) {
+              const page = await browser.newPage();
+              let movieNo = null;
+              page.on('request', req => {
+                if (movieNo) return;
+                const post = req.postData();
+                if (post && post.includes('movieNo=')) {
+                  const m = post.match(/movieNo=(\d+)/);
+                  if (m) movieNo = m[1];
+                }
+              });
+              try {
+                await page.goto('https://www.megabox.co.kr/booking/timetable', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await page.waitForTimeout(1500);
+                await page.locator(`text=${keyword}`).first().click({ timeout: 10000 });
+                await page.waitForTimeout(1500);
+              } catch (e) {
+                console.log(`"${keyword}": 메가박스 영화 목록에서 못 찾음 — 다음 실행에 재시도`);
+              }
+              await page.close();
+              if (movieNo) {
+                cache[keyword] = movieNo;
+                console.log(`"${keyword}": movieNo=${movieNo} 확인, 캐시 저장`);
+              }
+            }
+
+            await browser.close();
+            fs.writeFileSync('megabox_movie_cache.json', JSON.stringify(cache, null, 2));
+          })();
+          SCRIPT_EOF
+          node resolve_megabox.js
+
+      - name: Check booking status and notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          cat > check_megabox.js << 'SCRIPT_EOF'
+          const fs = require('fs');
+
+          function loadLines(file) {
+            if (!fs.existsSync(file)) return [];
+            return fs.readFileSync(file, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+          }
+
+          function loadMegaboxTheaters() {
+            const out = [];
+            for (const line of loadLines('theaters.txt')) {
+              const parts = line.split(',').map(s => s.trim());
+              if (parts[0] === 'MEGABOX' && parts[1] && parts[2]) out.push({ name: parts[1], areaCd: parts[2] });
+            }
+            return out;
+          }
+
+          function nextDates(n) {
+            const now = new Date(Date.now() + 9 * 60 * 60 * 1000); // KST
+            const out = [];
+            for (let i = 0; i <= n; i++) {
+              const d = new Date(now);
+              d.setDate(d.getDate() + i);
+              out.push(d.toISOString().slice(0, 10).replace(/-/g, ''));
+            }
+            return out;
+          }
+
+          async function getSchedule(movieNo, playDe, areaCd) {
+            const fd = new URLSearchParams();
+            fd.append('masterType', 'movie');
+            fd.append('movieNo', movieNo);
+            fd.append('movieNo1', movieNo);
+            fd.append('firstAt', 'Y');
+            fd.append('playDe', playDe);
+            fd.append('areaCd', areaCd);
+            const r = await fetch('https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do', { method: 'POST', body: fd });
+            const j = await r.json();
+            return (j.megaMap && j.megaMap.movieFormList) || [];
+          }
+
+          (async () => {
+            const keywords = loadLines('keywords.txt');
+            const theaters = loadMegaboxTheaters();
+            const cache = fs.existsSync('megabox_movie_cache.json') ? JSON.parse(fs.readFileSync('megabox_movie_cache.json', 'utf8')) : {};
+            if (keywords.length === 0 || theaters.length === 0) {
+              console.log('keywords.txt 또는 theaters.txt(MEGABOX)에 감시 대상이 없음. 종료.');
+              return;
+            }
+
+            const areaCds = [...new Set(theaters.map(t => t.areaCd))];
+            const state = fs.existsSync('megabox_state.json') ? JSON.parse(fs.readFileSync('megabox_state.json', 'utf8')) : {};
+            let stateChanged = false;
+            const dates = nextDates(7);
+
+            for (const keyword of keywords) {
+              const movieNo = cache[keyword];
+              if (!movieNo) {
+                console.log(`"${keyword}": movieNo 아직 미확인 — 스킵 (다음 실행에 재시도)`);
+                continue;
+              }
+
+              const found = {};
+              for (const areaCd of areaCds) {
+                const targets = theaters.filter(t => t.areaCd === areaCd);
+                for (const playDe of dates) {
+                  const list = await getSchedule(movieNo, playDe, areaCd);
+                  if (list.length === 0) continue;
+                  for (const theater of targets) {
+                    if (found[theater.name]) continue;
+                    if (list.some(item => (item.brchNm || '').includes(theater.name))) found[theater.name] = playDe;
+                  }
+                  if (targets.every(t => found[t.name])) break;
+                }
+              }
+
+              for (const theater of theaters) {
+                const stateKey = `${keyword}|${theater.name}`;
+                if (state[stateKey] === true) continue;
+
+                if (found[theater.name]) {
+                  console.log(`"${keyword}" @ 메가박스 ${theater.name}: 예매 오픈 확인 (${found[theater.name]})`);
+                  const content = `🎬 예매 오픈!\n영화: ${keyword}\n극장: 메가박스 ${theater.name}\n상영일: ${found[theater.name]}`;
+                  const res = await fetch(process.env.DISCORD_WEBHOOK, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content })
+                  });
+                  console.log('Discord 응답 상태:', res.status);
+                  state[stateKey] = true;
+                  stateChanged = true;
+                } else {
+                  console.log(`"${keyword}" @ 메가박스 ${theater.name}: 아직 미오픈`);
+                }
+              }
+            }
+
+            if (stateChanged) fs.writeFileSync('megabox_state.json', JSON.stringify(state, null, 2));
+          })();
+          SCRIPT_EOF
+          node check_megabox.js
+
+      - name: Commit updated state
+        run: |
+          git add megabox_state.json megabox_movie_cache.json 2>/dev/null || true
+          if [ -n "$(git status --porcelain megabox_state.json megabox_movie_cache.json 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update Megabox booking state/cache"
+            git push
+          else
+            echo "상태 변경 없음"
+          fi

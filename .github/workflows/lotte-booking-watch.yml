@@ -1,0 +1,202 @@
+name: 롯데시네마 예매 오픈 감시
+
+on:
+  schedule:
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 이미 movieCd를 찾아놓은 키워드는 Playwright가 필요 없음(순수 fetch로 충분) —
+      # 5분마다 돌리면서 매번 브라우저를 켜는 건 낭비라서, 새 키워드가 있을 때만 브라우저를 씀.
+      - name: Check whether movie-code resolution is needed
+        id: precheck
+        run: |
+          if [ ! -f lotte_movie_cache.json ]; then echo '{}' > lotte_movie_cache.json; fi
+          NEED=false
+          if [ -f keywords.txt ]; then
+            while IFS= read -r kw; do
+              [ -z "$kw" ] && continue
+              code=$(jq -r --arg k "$kw" '.[$k] // empty' lotte_movie_cache.json)
+              if [ -z "$code" ]; then NEED=true; fi
+            done < keywords.txt
+          fi
+          echo "need_resolution=$NEED" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        if: steps.precheck.outputs.need_resolution == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install Playwright
+        if: steps.precheck.outputs.need_resolution == 'true'
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install --with-deps chromium
+
+      - name: Resolve missing movie codes
+        if: steps.precheck.outputs.need_resolution == 'true'
+        run: |
+          cat > resolve_lotte.js << 'SCRIPT_EOF'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          const cache = fs.existsSync('lotte_movie_cache.json') ? JSON.parse(fs.readFileSync('lotte_movie_cache.json', 'utf8')) : {};
+          const keywords = fs.readFileSync('keywords.txt', 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+          const missing = keywords.filter(k => !cache[k]);
+
+          (async () => {
+            if (missing.length === 0) return;
+            const browser = await chromium.launch();
+
+            for (const keyword of missing) {
+              const page = await browser.newPage();
+              let movieCd = null;
+              page.on('request', req => {
+                if (movieCd) return;
+                const post = req.postData();
+                if (post) {
+                  const m = post.match(/"(?:representationMovieCode|movieCd)":"(\d+)"/);
+                  if (m) movieCd = m[1];
+                }
+              });
+              try {
+                await page.goto('https://www.lottecinema.co.kr/NLCHS/Ticketing', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                await page.waitForTimeout(1500);
+                await page.locator(`text=${keyword}`).first().click({ timeout: 10000 });
+                await page.waitForTimeout(1500);
+              } catch (e) {
+                console.log(`"${keyword}": 롯데시네마 영화 목록에서 못 찾음 — 다음 실행에 재시도`);
+              }
+              await page.close();
+              if (movieCd) {
+                cache[keyword] = movieCd;
+                console.log(`"${keyword}": movieCd=${movieCd} 확인, 캐시 저장`);
+              }
+            }
+
+            await browser.close();
+            fs.writeFileSync('lotte_movie_cache.json', JSON.stringify(cache, null, 2));
+          })();
+          SCRIPT_EOF
+          node resolve_lotte.js
+
+      - name: Check booking status and notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          cat > check_lotte.js << 'SCRIPT_EOF'
+          const fs = require('fs');
+
+          function loadLines(file) {
+            if (!fs.existsSync(file)) return [];
+            return fs.readFileSync(file, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+          }
+
+          function loadLotteTheaters() {
+            const out = [];
+            for (const line of loadLines('theaters.txt')) {
+              const parts = line.split(',').map(s => s.trim());
+              if (parts[0] === 'LOTTE' && parts[1] && parts[2]) out.push({ name: parts[1], cinemaID: parts[2] });
+            }
+            return out;
+          }
+
+          function nextDates(n) {
+            const now = new Date(Date.now() + 9 * 60 * 60 * 1000); // KST
+            const out = [];
+            for (let i = 0; i <= n; i++) {
+              const d = new Date(now);
+              d.setDate(d.getDate() + i);
+              out.push(d.toISOString().slice(0, 10));
+            }
+            return out;
+          }
+
+          async function getPlaySequence(cinemaID, movieCd, playDate) {
+            const fd = new URLSearchParams();
+            fd.append('paramList', JSON.stringify({
+              MethodName: 'GetPlaySequence', channelType: 'HO', osType: 'W', osVersion: 'bot',
+              playDate, cinemaID, representationMovieCode: movieCd
+            }));
+            const r = await fetch('https://www.lottecinema.co.kr/LCWS/Ticketing/TicketingData.aspx', { method: 'POST', body: fd });
+            const j = await r.json();
+            return (j.PlaySeqsHeader && j.PlaySeqsHeader.Items) || [];
+          }
+
+          (async () => {
+            const keywords = loadLines('keywords.txt');
+            const theaters = loadLotteTheaters();
+            const cache = fs.existsSync('lotte_movie_cache.json') ? JSON.parse(fs.readFileSync('lotte_movie_cache.json', 'utf8')) : {};
+            if (keywords.length === 0 || theaters.length === 0) {
+              console.log('keywords.txt 또는 theaters.txt(LOTTE)에 감시 대상이 없음. 종료.');
+              return;
+            }
+
+            const state = fs.existsSync('lotte_state.json') ? JSON.parse(fs.readFileSync('lotte_state.json', 'utf8')) : {};
+            let stateChanged = false;
+            const dates = nextDates(7);
+
+            for (const keyword of keywords) {
+              const movieCd = cache[keyword];
+              if (!movieCd) {
+                console.log(`"${keyword}": movieCd 아직 미확인 — 스킵 (다음 실행에 재시도)`);
+                continue;
+              }
+
+              for (const theater of theaters) {
+                const stateKey = `${keyword}|${theater.name}`;
+                if (state[stateKey] === true) continue;
+
+                let openDate = null;
+                for (const playDate of dates) {
+                  const items = await getPlaySequence(theater.cinemaID, movieCd, playDate);
+                  if (items.length > 0) { openDate = playDate; break; }
+                }
+
+                if (openDate) {
+                  console.log(`"${keyword}" @ 롯데시네마 ${theater.name}: 예매 오픈 확인 (${openDate})`);
+                  const content = `🎬 예매 오픈!\n영화: ${keyword}\n극장: 롯데시네마 ${theater.name}\n상영일: ${openDate}`;
+                  const res = await fetch(process.env.DISCORD_WEBHOOK, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content })
+                  });
+                  console.log('Discord 응답 상태:', res.status);
+                  state[stateKey] = true;
+                  stateChanged = true;
+                } else {
+                  console.log(`"${keyword}" @ 롯데시네마 ${theater.name}: 아직 미오픈`);
+                }
+              }
+            }
+
+            if (stateChanged) fs.writeFileSync('lotte_state.json', JSON.stringify(state, null, 2));
+          })();
+          SCRIPT_EOF
+          node check_lotte.js
+
+      - name: Commit updated state
+        run: |
+          git add lotte_state.json lotte_movie_cache.json 2>/dev/null || true
+          if [ -n "$(git status --porcelain lotte_state.json lotte_movie_cache.json 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git commit -m "chore: update Lotte Cinema booking state/cache"
+            git push
+          else
+            echo "상태 변경 없음"
+          fi

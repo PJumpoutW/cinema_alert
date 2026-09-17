@@ -2,7 +2,7 @@ name: CGV 예매 오픈 감시
 
 on:
   schedule:
-    - cron: '17 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -19,6 +19,12 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
       - name: Install Playwright
         run: |
           npm init -y
@@ -33,24 +39,29 @@ jobs:
           const { chromium } = require('playwright');
           const fs = require('fs');
 
-          // 지점명 -> CGV 내부 siteNo. 추가하려면 여기에 한 줄 더.
-          const SITES = {
-            '용산': '0013',
-            '영등포': '0059',
-          };
           const KEYWORDS_FILE = 'keywords.txt';
+          const THEATERS_FILE = 'theaters.txt';
           const STATE_FILE = 'cgv_state.json';
 
-          function loadKeywords() {
-            if (!fs.existsSync(KEYWORDS_FILE)) return [];
-            return fs.readFileSync(KEYWORDS_FILE, 'utf8')
-              .split('\n').map(s => s.trim()).filter(Boolean);
+          function loadLines(file) {
+            if (!fs.existsSync(file)) return [];
+            return fs.readFileSync(file, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+          }
+
+          function loadCgvSites() {
+            const sites = {};
+            for (const line of loadLines(THEATERS_FILE)) {
+              const [chain, name, code] = line.split(',').map(s => s.trim());
+              if (chain === 'CGV' && name && code) sites[name] = code;
+            }
+            return sites;
           }
 
           (async () => {
-            const keywords = loadKeywords();
-            if (keywords.length === 0) {
-              console.log('keywords.txt에 감시할 키워드가 없음. 종료.');
+            const keywords = loadLines(KEYWORDS_FILE);
+            const SITES = loadCgvSites();
+            if (keywords.length === 0 || Object.keys(SITES).length === 0) {
+              console.log('keywords.txt 또는 theaters.txt(CGV)에 감시 대상이 없음. 종료.');
               return;
             }
 
@@ -59,18 +70,15 @@ jobs:
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             });
 
-            // Cloudflare는 순수 curl을 차단함 (직접 확인함) — 실제 페이지를 먼저 띄워서
-            // Cloudflare를 통과한 뒤, 그 페이지 컨텍스트 안에서 fetch를 실행해야 함.
             try {
               await page.goto('https://cgv.co.kr', { waitUntil: 'domcontentloaded', timeout: 30000 });
             } catch (e) {
-              await page.screenshot({ path: 'failure.png', fullPage: true }).catch(() => {});
-              fs.writeFileSync('failure.html', await page.content().catch(() => ''));
+              await page.screenshot({ path: 'cgv_failure.png', fullPage: true }).catch(() => {});
+              fs.writeFileSync('cgv_failure.html', await page.content().catch(() => ''));
               await browser.close();
               throw e;
             }
 
-            // 전체 무비차트(상영중+상영예정 중 예매 활동 있는 작품) 목록 — 여기서 제목으로 movNo를 찾음.
             const chart = await page.evaluate(async () => {
               const r = await fetch('https://cgv.co.kr/api/v1/booking/searchAtktTopPostrList?coCd=A420');
               return (await r.json()).data || [];
@@ -82,14 +90,13 @@ jobs:
             for (const keyword of keywords) {
               const movie = chart.find(m => m.movNm.includes(keyword));
               if (!movie) {
-                console.log(`"${keyword}": 아직 CGV 차트에 없음 (예매 활동 전) — 스킵`);
+                console.log(`"${keyword}": 아직 CGV 차트에 없음 — 스킵`);
                 continue;
               }
 
               for (const [siteName, siteNo] of Object.entries(SITES)) {
                 const stateKey = `${keyword}|${siteName}`;
-                const alreadyOpen = state[stateKey] === true;
-                if (alreadyOpen) continue; // 이미 알림 보낸 조합은 다시 안 봄
+                if (state[stateKey] === true) continue;
 
                 const dates = await page.evaluate(async ({ movNo, siteNo }) => {
                   const r = await fetch(`https://cgv.co.kr/api/v1/booking/searchSiteScnscYmdListByMov?coCd=A420&movNo=${movNo}&siteNo=${siteNo}`);
@@ -125,8 +132,8 @@ jobs:
         with:
           name: cgv-failure-evidence
           path: |
-            failure.png
-            failure.html
+            cgv_failure.png
+            cgv_failure.html
           retention-days: 7
           if-no-files-found: ignore
 
