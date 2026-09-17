@@ -67,18 +67,20 @@ jobs:
               const page = await browser.newPage();
               let movieCd = null;
               const seenPosts = [];
-              page.on('request', req => {
-                const post = req.postData();
-                if (post) seenPosts.push(post.slice(0, 200));
-                if (!movieCd && post) {
-                  const m = post.match(/"(?:representationMovieCode|movieCd)":"(\d+)"/);
-                  if (m) movieCd = m[1];
-                }
-              });
               try {
+                // 페이지 로드 직후엔 기본 선택된(엉뚱한) 영화의 요청이 먼저 나갈 수 있으므로,
+                // 그게 다 끝난 뒤에야 감청을 시작해서 우리가 클릭한 영화만 잡는다.
                 await page.goto('https://www.lottecinema.co.kr/NLCHS/Ticketing', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 await page.waitForTimeout(1500);
                 console.log(`"${keyword}": 페이지 로드 완료, 클릭 시도`);
+                page.on('request', req => {
+                  const post = req.postData();
+                  if (post) seenPosts.push(post.slice(0, 200));
+                  if (!movieCd && post) {
+                    const m = post.match(/"(?:representationMovieCode|movieCd)":"(\d+)"/);
+                    if (m) movieCd = m[1];
+                  }
+                });
                 await page.locator(`text=${keyword}`).first().click({ timeout: 10000 });
                 console.log(`"${keyword}": 클릭 성공, 네트워크 대기`);
                 await page.waitForTimeout(1500);
